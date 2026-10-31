@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Matrix Kamera</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: full-bleed code canvas, one floating control strip at the bottom edge */
+:root{
+  --void:#010402; --phosphor:#00ff5a; --phosphor-dim:#0b7a33; --glass:rgba(2,14,6,.78);
+  --line:rgba(0,255,90,.28); --ink:#c8ffd9;
+  --mono:"Share Tech Mono","Courier New",ui-monospace,monospace;
+  color-scheme:dark;
+}
+html,body{height:100%;margin:0;background:var(--void);color:var(--ink);overflow:hidden;font-family:var(--mono)}
+#screen{position:fixed;inset:0;width:100%;height:100%;display:block;background:var(--void)}
+video,#src{display:none}
+.bar{
+  position:fixed;left:0;right:0;bottom:0;
+  padding:10px max(12px,env(safe-area-inset-right,0px)) calc(10px + env(safe-area-inset-bottom,0px)) max(12px,env(safe-area-inset-left,0px));
+  background:linear-gradient(to top,var(--glass) 70%,transparent);
+  display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:center;
+  transition:opacity .4s;
+}
+.bar.hide{opacity:0;pointer-events:none}
+button,label.btn{
+  font:inherit;font-size:13px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--phosphor);background:rgba(0,30,12,.6);border:1px solid var(--line);
+  padding:9px 12px;border-radius:2px;cursor:pointer;white-space:nowrap;
+}
+button:hover,label.btn:hover{border-color:var(--phosphor);box-shadow:0 0 12px rgba(0,255,90,.35)}
+button:focus-visible,label.btn:focus-within,input:focus-visible{outline:1px solid var(--phosphor);outline-offset:2px}
+button.primary{background:var(--phosphor);color:var(--void);border-color:var(--phosphor);font-weight:bold}
+.slider{display:flex;align-items:center;gap:6px;font-size:11px;letter-spacing:.1em;color:var(--phosphor-dim);text-transform:uppercase}
+.slider input{width:90px;accent-color:var(--phosphor)}
+#file{position:absolute;width:1px;height:1px;opacity:0}
+.status{
+  position:fixed;left:50%;transform:translateX(-50%);
+  top:calc(14px + env(safe-area-inset-top,0px));
+  font-size:12px;letter-spacing:.12em;color:var(--phosphor);text-shadow:0 0 8px var(--phosphor);
+  background:rgba(0,0,0,.55);padding:6px 10px;border:1px solid var(--line);
+  max-width:calc(100% - 32px);text-align:center;transition:opacity .6s;
+}
+.status.fade{opacity:0}
+</style>
+</head>
+<body>
+
+<canvas id="screen" aria-label="Kamerabild als fallender grüner Code"></canvas>
+<video id="video" playsinline muted autoplay></video>
+<canvas id="src"></canvas>
+<div class="status" id="status">DEMO · TIPPE AUF „KAMERA“</div>
+
+<div class="bar" id="bar">
+  <button class="primary" id="camBtn" type="button">Kamera</button>
+  <button id="flipBtn" type="button">Wechseln</button>
+  <label class="btn">Foto / Video<input id="file" type="file" accept="image/*,video/*"></label>
+  <span class="slider"><label for="size">Größe</label><input id="size" type="range" min="8" max="28" value="14"></span>
+  <span class="slider"><label for="rain">Regen</label><input id="rain" type="range" min="0" max="100" value="60"></span>
+  <span class="slider"><label for="edge">Kanten</label><input id="edge" type="range" min="0" max="100" value="55"></span>
+  <button id="fsBtn" type="button">Vollbild</button>
+</div>
+
+<script>
+(() => {
+  const screen = document.getElementById('screen'), ctx = screen.getContext('2d');
+  const video = document.getElementById('video');
+  const src = document.getElementById('src'), sctx = src.getContext('2d', { willReadFrequently: true });
+  const statusEl = document.getElementById('status'), bar = document.getElementById('bar');
+  const $ = id => document.getElementById(id);
+
+  // Glyph set: half-width katakana, digits and a few symbols, like the film's code
+  let glyphs = '';
+  for (let c = 0xFF66; c <= 0xFF9D; c++) glyphs += String.fromCharCode(c);
+  glyphs += '0123456789Z:.="*+-<>¦|';
+  const G = glyphs.length;
+
+  // 40 colour steps from deep green to white-hot head
+  const STEPS = 40, palette = [];
+  for (let i = 0; i < STEPS; i++) {
+    const t = i / (STEPS - 1);
+    const l = 4 + t * 52 + Math.max(0, t - .82) * 220;   // lightness, jumps to white at the top end
+    palette.push(`hsl(${135 - t * 10}, 100%, ${Math.min(l, 92)}%)`);
+  }
+
+  let fs = 14, cols = 0, rows = 0, cw = 0, ch = 0, dpr = 1;
+  let chars, energy, heads, speeds;
+  let source = 'demo', facing = 'environment', stream = null, image = null;
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function setStatus(t, fade = true) {
+    statusEl.textContent = t; statusEl.classList.remove('fade');
+    clearTimeout(setStatus.t);
+    if (fade) setStatus.t = setTimeout(() => statusEl.classList.add('fade'), 3500);
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = innerWidth, h = innerHeight;
+    screen.width = w * dpr; screen.height = h * dpr;
+    cw = fs * 0.72; ch = fs;
+    cols = Math.ceil(w / cw); rows = Math.ceil(h / ch);
+    src.width = cols; src.height = rows;
+    const n = cols * rows;
+    chars = new Uint16Array(n); energy = new Float32Array(n);
+    for (let i = 0; i < n; i++) chars[i] = Math.random() * G | 0;
+    heads = new Float32Array(cols); speeds = new Float32Array(cols);
+    for (let x = 0; x < cols; x++) { heads[x] = Math.random() * -rows; speeds[x] = .25 + Math.random() * .55; }
+  }
+
+  // Demo scene: a corridor in perspective with a slow sphere, so the page shows the effect before any camera
+  function drawDemo(t) {
+    const w = cols, h = rows, vx = w / 2, vy = h * .45;
+    sctx.fillStyle = '#111'; sctx.fillRect(0, 0, w, h);
+    sctx.strokeStyle = '#bbb'; sctx.lineWidth = 1;
+    const corners = [[0,0],[w,0],[w,h],[0,h]];
+    sctx.beginPath();
+    for (const [x, y] of corners) { sctx.moveTo(x, y); sctx.lineTo(vx, vy); }
+    sctx.stroke();
+    for (let k = 1; k < 7; k++) {
+      const s = ((k + t * .0004) % 7) / 7, f = Math.pow(s, 1.8);
+      sctx.strokeStyle = `rgba(200,200,200,${.25 + f * .6})`;
+      sctx.strokeRect(vx - vx * f, vy - vy * f, w * f, h * f);
+    }
+    const bx = vx + Math.sin(t * .0007) * w * .22, by = vy + Math.cos(t * .0005) * h * .12, r = Math.min(w, h) * .14;
+    const g = sctx.createRadialGradient(bx - r * .3, by - r * .3, r * .1, bx, by, r);
+    g.addColorStop(0, '#fff'); g.addColorStop(1, '#333');
+    sctx.fillStyle = g; sctx.beginPath(); sctx.arc(bx, by, r, 0, Math.PI * 2); sctx.fill();
+  }
+
+  // Draw the current source into the tiny grid canvas (object-fit: cover)
+  function sample(t) {
+    if (source === 'demo') return drawDemo(t);
+    let el, sw, sh;
+    if (source === 'image') { el = image; sw = image.naturalWidth; sh = image.naturalHeight; }
+    else { el = video; sw = video.videoWidth; sh = video.videoHeight; if (!sw) return; }
+    const scale = Math.max(cols / sw, rows / sh), dw = sw * scale, dh = sh * scale;
+    sctx.save();
+    if (source === 'camera' && facing === 'user') { sctx.translate(cols, 0); sctx.scale(-1, 1); }
+    sctx.drawImage(el, (cols - dw) / 2, (rows - dh) / 2, dw, dh);
+    sctx.restore();
+  }
+
+  let last = 0, acc = 0;
+  function frame(t) {
+    const dt = Math.min(t - last, 100); last = t;
+    sample(t);
+    let px;
+    try { px = sctx.getImageData(0, 0, cols, rows).data; } catch { requestAnimationFrame(frame); return; }
+
+    const rainAmt = $('rain').value / 100, edgeAmt = $('edge').value / 100 * 2.2;
+    const step = reduceMotion ? .15 : 1;
+
+    // Advance rain at ~30 steps/second
+    acc += dt;
+    while (acc > 33) {
+      acc -= 33;
+      for (let i = 0; i < energy.length; i++) energy[i] *= .9;
+      for (let x = 0; x < cols; x++) {
+        heads[x] += speeds[x] * step;
+        const y = heads[x] | 0;
+        if (y >= 0 && y < rows) { const i = y * cols + x; energy[i] = 1; chars[i] = Math.random() * G | 0; }
+        if (heads[x] > rows + 10 && Math.random() < .03) { heads[x] = Math.random() * -12; speeds[x] = .25 + Math.random() * .55; }
+      }
+      const flips = (chars.length * .02) | 0;           // glyphs keep mutating in place
+      for (let k = 0; k < flips; k++) chars[Math.random() * chars.length | 0] = Math.random() * G | 0;
+    }
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#010402'; ctx.fillRect(0, 0, screen.width, screen.height);
+    ctx.font = `${fs * dpr}px "MS Gothic","Hiragino Kaku Gothic ProN","Noto Sans Mono CJK JP","Noto Sans JP",monospace`;
+    ctx.textBaseline = 'top';
+
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        const i = y * cols + x, p = i * 4;
+        const l = (px[p] * .299 + px[p + 1] * .587 + px[p + 2] * .114) / 255;
+        const r = x + 1 < cols ? i + 1 : i, d = y + 1 < rows ? i + cols : i;
+        const lr = (px[r * 4] * .299 + px[r * 4 + 1] * .587 + px[r * 4 + 2] * .114) / 255;
+        const ld = (px[d * 4] * .299 + px[d * 4 + 1] * .587 + px[d * 4 + 2] * .114) / 255;
+        let lum = Math.pow(l, 1.3) * 1.1 + (Math.abs(l - lr) + Math.abs(l - ld)) * edgeAmt;
+        lum = Math.min(1, lum);
+        const e = energy[i];
+        let b = lum * ((1 - rainAmt) + rainAmt * (.25 + e * 1.1)) + e * rainAmt * .12;
+        if (e > .97) b = Math.max(b, .55 + lum * .45);        // bright falling heads
+        if (b < .04) continue;
+        const s = Math.min(STEPS - 1, b * (STEPS - 1) | 0);
+        ctx.fillStyle = palette[s];
+        // mirrored glyphs, as on the film's screens
+        ctx.setTransform(-1, 0, 0, 1, (x * cw + cw) * dpr, y * ch * dpr);
+        ctx.fillText(glyphs[chars[i]], 0, 0);
+      }
+    }
+    requestAnimationFrame(frame);
+  }
+
+  async function startCamera() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setStatus('KEINE LIVE-KAMERA HIER · NUTZE „FOTO / VIDEO“', false); return;
+    }
+    try {
+      stream?.getTracks().forEach(t => t.stop());
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1280 } }, audio: false });
+      video.srcObject = stream; await video.play();
+      source = 'camera'; setStatus('VERBUNDEN');
+    } catch (err) {
+      setStatus('KAMERA BLOCKIERT · ÖFFNE DIE DATEI IM BROWSER ODER NUTZE „FOTO / VIDEO“', false);
+    }
+  }
+
+  $('camBtn').onclick = startCamera;
+  $('flipBtn').onclick = () => { facing = facing === 'user' ? 'environment' : 'user'; if (source === 'camera') startCamera(); else setStatus(facing === 'user' ? 'FRONTKAMERA GEWÄHLT' : 'RÜCKKAMERA GEWÄHLT'); };
+  $('file').onchange = e => {
+    const f = e.target.files[0]; if (!f) return;
+    const url = URL.createObjectURL(f);
+    stream?.getTracks().forEach(t => t.stop()); stream = null;
+    if (f.type.startsWith('video')) {
+      video.srcObject = null; video.src = url; video.loop = true;
+      video.play().then(() => { source = 'video'; setStatus('VIDEO GELADEN'); }).catch(() => setStatus('VIDEO KONNTE NICHT ABGESPIELT WERDEN'));
+    } else {
+      const img = new Image();
+      img.onload = () => { image = img; source = 'image'; setStatus('FOTO GELADEN'); };
+      img.src = url;
+    }
+  };
+  $('size').oninput = e => { fs = +e.target.value; resize(); };
+  $('fsBtn').onclick = () => {
+    const d = document;
+    if (d.fullscreenElement) d.exitFullscreen?.().catch(() => {});
+    else d.documentElement.requestFullscreen?.().catch(() => setStatus('VOLLBILD NICHT VERFÜGBAR'));
+  };
+
+  // Tap the picture to hide/show the controls
+  screen.addEventListener('click', () => bar.classList.toggle('hide'));
+  addEventListener('resize', resize);
+  navigator.wakeLock?.request('screen').catch(() => {});
+
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+
+</body>
+</html>
